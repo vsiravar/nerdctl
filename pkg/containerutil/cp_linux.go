@@ -22,6 +22,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -43,23 +44,41 @@ func CopyFiles(ctx context.Context, client *containerd.Client, container contain
 		return err
 	}
 	logrus.Debugf("Detected tar binary %q (GNU=%v)", tarBinary, isGNUTar)
-	var srcFull, dstFull, root string
+	var srcFull, dstFull, root, mountDestination, path string
 	var cleanup func()
 	task, err := container.Task(ctx, nil)
 	if err != nil {
-		// if the task is simply not found, we should try to mount the snapshot. any other type of error from Task() is fatal here.
 		// Rootless does not support copying into/out of stopped/created containers as we need to nsenter into the user namespace of the
 		// pid of the running container with --preserve-credentials to preserve uid/gid mapping and copy files into the container.
-
-		if !errdefs.IsNotFound(err) || rootlessutil.IsRootless() {
+		if rootlessutil.IsRootless() {
+			return fmt.Errorf("cannot use cp with stopped containers in rootless mode")
+		}
+		// if the task is simply not found, we should try to mount the snapshot. any other type of error from Task() is fatal here.
+		if !errdefs.IsNotFound(err) {
 			return err
 		}
-		root, cleanup, err = mountSnapshotForContainer(ctx, client, container, snapshotter)
-		if cleanup != nil {
-			defer cleanup()
+		if container2host {
+			path = src
+		} else {
+			path = dst
 		}
+		// Check if path is in a volume
+		root, mountDestination, err = getContainerMountInfo(ctx, container, path, container2host)
 		if err != nil {
 			return err
+		}
+		// if path is in a volume and not read-only then handle volume paths, else path is not in volume so mount
+		// container snapshot for copy
+		if root != "" {
+			dst, src = handleVolumePaths(container2host, dst, src, mountDestination)
+		} else {
+			root, cleanup, err = mountSnapshotForContainer(ctx, client, container, snapshotter)
+			if cleanup != nil {
+				defer cleanup()
+			}
+			if err != nil {
+				return err
+			}
 		}
 	} else {
 		status, err := task.Status(ctx)
@@ -72,12 +91,27 @@ func CopyFiles(ctx context.Context, client *containerd.Client, container contain
 			if rootlessutil.IsRootless() {
 				return fmt.Errorf("cannot use cp with stopped containers in rootless mode")
 			}
-			root, cleanup, err = mountSnapshotForContainer(ctx, client, container, snapshotter)
-			if cleanup != nil {
-				defer cleanup()
+			if container2host {
+				path = src
+			} else {
+				path = dst
 			}
+			root, mountDestination, err = getContainerMountInfo(ctx, container, path, container2host)
 			if err != nil {
 				return err
+			}
+			// if path is in a volume and not read-only then handle volume paths, else path is not in volume so mount
+			// container snapshot for copy
+			if root != "" {
+				dst, src = handleVolumePaths(container2host, dst, src, mountDestination)
+			} else {
+				root, cleanup, err = mountSnapshotForContainer(ctx, client, container, snapshotter)
+				if cleanup != nil {
+					defer cleanup()
+				}
+				if err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -246,4 +280,51 @@ func mountSnapshotForContainer(ctx context.Context, client *containerd.Client, c
 		os.RemoveAll(tempDir)
 	}
 	return tempDir, cleanup, nil
+}
+
+func getContainerMountInfo(ctx context.Context, con containerd.Container, containerPath string, container2host bool) (string, string, error) {
+	filePath := filepath.Clean(containerPath)
+	spec, err := con.Spec(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	// read-only applies only while copying into container from host
+	if !container2host && spec.Root.Readonly {
+		return "", "", fmt.Errorf("container rootfs: %s is marked read-only", spec.Root.Path)
+	}
+
+	for _, mount := range spec.Mounts {
+		if isSelfOrDescendant(filePath, mount.Destination) {
+			// read-only applies only while copying into container
+			if !container2host {
+				for _, option := range mount.Options {
+					if option == "ro" {
+						return "", "", fmt.Errorf("mount point %s is marked read-only", filePath)
+					}
+				}
+			}
+			return mount.Source, mount.Destination, nil
+		}
+	}
+	return "", "", nil
+}
+
+func isSelfOrDescendant(filePath, potentialAncestor string) bool {
+	if filePath == "/" || filePath == "" || potentialAncestor == "" {
+		return false
+	}
+	filePath = filepath.Clean(filePath)
+	potentialAncestor = filepath.Clean(potentialAncestor)
+	if filePath == potentialAncestor {
+		return true
+	}
+	return isSelfOrDescendant(path.Dir(filePath), potentialAncestor)
+}
+
+// When the path is in volume remove directory that volume is mounted on from the path
+func handleVolumePaths(container2host bool, dst string, src string, mountDestination string) (string, string) {
+	if container2host {
+		return dst, strings.TrimPrefix(filepath.Clean(src), mountDestination)
+	}
+	return strings.TrimPrefix(filepath.Clean(dst), mountDestination), src
 }
