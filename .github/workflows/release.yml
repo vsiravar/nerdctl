@@ -1,10 +1,8 @@
 # See https://github.com/containerd/nerdctl/blob/main/MAINTAINERS_GUIDE.md for how to make a release.
 name: Release
 on:
-  push:
-    tags:
-    - 'v*'
-    - 'test-action-release-*'
+  workflow_dispatch:
+
 env:
   GO111MODULE: on
 jobs:
