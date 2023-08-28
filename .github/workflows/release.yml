@@ -2,6 +2,7 @@
 name: Release
 on:
   push:
+    workflow_dispatch:
     tags:
     - 'v*'
     - 'test-action-release-*'
