@@ -1,8 +1,8 @@
 # See https://github.com/containerd/nerdctl/blob/main/MAINTAINERS_GUIDE.md for how to make a release.
 name: Release
 on:
+  workflow_dispatch:
   push:
-    workflow_dispatch:
     tags:
     - 'v*'
     - 'test-action-release-*'
